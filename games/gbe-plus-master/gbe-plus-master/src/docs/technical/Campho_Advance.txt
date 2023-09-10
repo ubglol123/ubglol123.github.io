@@ -1,0 +1,460 @@
+Campho Advance Technical Documentation 0.1
+June 13th, 2023
+Shonumi aka D.S. Baxter
+
+
+***************************************************
+1. Introduction
+***************************************************
+
+The Campho Advance is a cartridge for the Game Boy Advance that allowed users to make video-based phonecalls. Released in Japan on July 30, 2004, it was sold in limited quanitites by Digital Act. The hardware features a built-in camera that points towards the user's face to capture a live video stream.
+
+
+***************************************************
+2. General Hardware Information
+***************************************************
+
+- Comes in an oversized red and black cartridge with a bulky top-end.
+- Has a camera embedded in the upper center of the cartridge, captures video at ~5 FPS.
+- Camera's native resolution is around 110,000 pixels.
+- Has a RJ-11 phone jack on the side. Transmits and receives data over standard landlines.
+- Has a microphone jack on the side for voice input.
+- Requires constant external power to boot and has a port for an AGS-002 AC Adapter.
+- Not compatible with any model of Nintendo DS; system will fail to boot.
+- Contains some memory used to save contact information.
+- Uses a unique method of mapping ROM data.
+
+
+***************************************************
+3. I/O Registers
+***************************************************
+
+The Campho Advance uses a handful of I/O registers and address ranges mainly for reading ROM data via its unique mapper.
+
+-----------------------------------------------------------
+Address Range                  | I/O Name
+-----------------------------------------------------------
+0x8000000 - 0x8007FFF          | ROM_DATA_1	(ROM Data Stream 1)
+0x8008000 - 0x800FFFF          | ROM_DATA_2	(ROM Data Stream 2)
+0x8010000                      | ROM_STAT	(ROM Status)
+0x8014000                      | ROM_CNT	(ROM Control)
+-----------------------------------------------------------
+
+These I/O registers are also available from Wait State 1 (0xA000000). Currently unknown if they are available from Wait State 2 (0xC000000) as well. All I/O is 16-bit as well.
+
+ROM_DATA_1 and ROM_DATA_2 act as different 16-bits streams to read ROM. Data is pulled from ROM sequentially with each read to these regions, including code fetches requested by the CPU. As such, the internal read pointer automatically advances on its own. ROM_DATA_2 is special as it is primarily used to read the second portion of the bootstrap ROM (BS2). ROM_DATA_1 reads the first part of the bootstrap ROM (BS1) as well as nearly all other data such as Program ROM and Graphics ROM. ROM_DATA_1 can also be used as input for certain parameters when prompting a read command for Graphics ROM.
+
+ROM_STAT acts as a status flag of sorts indicating when certain data on Campho is ready to be read. Used extensively to read Program ROM and prompting a read command for Graphics ROM.
+
+ROM_CNT acts as an overall control register that determines what operations the Campho Advance will execute for reading or writing ROM data.
+
+
+***************************************************
+4. ROM Data Sections
+***************************************************
+
+The Campho Advance has at least 3 different areas of ROM, each with their own method of access. They are also divided by what purpose they serve.
+
+-----------------------------------------------------------
+ROM Name		| Function
+-----------------------------------------------------------
+Bootstrap ROM		| Handles initial program loading
+Program ROM		| Main code for the Campho Advance
+Graphics ROM		| Bitmap graphics for menus
+-----------------------------------------------------------
+
+In terms of how the Campho Advance works, it first loads up bootstrap ROM in two parts. From there, the bootstrap runs and loads the entirety of Program ROM. Once that transfer completes, Program ROM takes over and runs until the GBA shuts down. Its job is to enter/exit menus, receive and send videocalls, and handle everything else the Campho Advance is capable of. It will periodically read large portions of Graphics ROM as needed depending on the menus it enters.
+
+
+***************************************************
+5. Bootstrap ROM
+***************************************************
+
+The bootstrap ROM is available for the CPU to read immediately once the GBA powers on (and provided the Campho Advance also has power supplied to it). This section of ROM is partitioned in 2, named BS1 and BS2. They can be read at ROM_DATA_1 and ROM_DATA_2 respectively. Technically, BS1 contains a valid ROM header and the "Game Boy Advance" logo necessary for the GBA's cartridge check, however, by the time any software outside of the BIOS has a chance to access the Campho Advance, the internal read pointer has moved past this part. There is no known mechanism to reset the read pointer when accessing the bootstrap ROM.
+
+No special proceedure is necessary to read BS1 or BS2. Simply reading ROM_DATA_1 or ROM_DATA_2 is enough. Without the header, BS1 measures in at 72 bytes. BS2 measures 122 bytes in total. The Campho Advance begins in BS1, pulling data via code fetches. BS1's purpose is to load executable code in RAM for BS2 and then jump. Since the Campho Advance's mapper always advances its internal read pointer (regardless of what the CPU's PC register is) the only way for the Campho Advance to run branching code is by copying it to RAM first. BS2's role is to load all of Program ROM into RAM and then jump to execute it.
+
+Once all of the data for either BS1 or BS2 has been read, the Campho Advance will return garbage data.
+
+
+***************************************************
+6. Program ROM
+***************************************************
+
+Program ROM is the heart of the Campho Advance. It contains all of the code needed to operate the hardware. It measures exactly 65440 bytes, and the Campho Advance breaks that up into separate 4090 byte banks. BS2 is responsible for reading each block, copying them to the GBA's 256KB WRAM, and jumping to the start of Program ROM to begin execution. The following process is used to read each block.
+
+------------------------------------------------------------------------
+//Preps a block for reading
+ROM_CNT = 0xA00A
+
+CHECK_LOOP:
+
+//Empty while loop, run indefinitely until condition is true
+WHILE (ROM_STAT & 0xA00A) NOT EQUAL TO 0xA00A
+
+//Read Block ID and Block Length from ROM Data Stream 1
+ROM_STAT = 0xA00A
+BLOCK_ID = READ 16 BITS FROM [ROM_DATA_1]
+BLOCK_LEN = READ 16 BITS [ROM_DATA_1]
+
+//Read data as long as Block ID is not 0xCD00
+IF BLOCK_ID NOT EQUAL TO 0xCD00
+
+        //Read data for the amount of bytes in the block
+	//Store in 256KB WRAM
+        WHILE BLOCK_LEN NOT EQUAL TO 0x00
+                DATA_VAL = READ 16 BITS FROM [ROM_DATA_1] 
+                [0x2000000 + INDEX] = DATA_VAL
+
+                INDEX = INDEX + 2
+                BLOCK_LEN = BLOCK_LEN - 2
+
+        //Resets stuff to read next block
+	//Yes, *2* subsequent writes ROM_DATA_1, probably to reset Block ID and Length
+        [ROM_DATA_1] = 0x00
+        [ROM_DATA_1] = 0x00
+
+	//Preps a block for reading
+        ROM_CNT = 0xA00A
+
+        GOTO CHECK_LOOP
+------------------------------------------------------------------------
+
+First, ROM_CNT is set to 0xA00A, then the program must wait for ROM_STAT to read back the same value. Afterwards, writing 0xA00A to ROM_STAT will prompt the Campho Advance to begin reading the block. The first 32-bits (broken down into 2 16-bit values) of each block contains metadata about the block's ID and the total number bytes in the block. The block ID has a valid range of 0xCC00 to 0xCC0F. The next block ID after 0xCC0F is 0xCD00, which is a dummy zero-length block that signals the end of Program ROM. It is important to remember that any read from ROM_DATA_1 will grab Program ROM data sequentially, so the Campho Advance uses a constant value of 0x8000000. After all data within a block has been read, the Campho Advance needs to be prepped to read the next one. This involves writing zeroes to ROM_DATA_1 twice and then setting ROM_CNT to 0xA00A once more.
+
+
+***************************************************
+6. Graphics ROM
+***************************************************
+
+Graphics ROM contains various bitmap graphics for the Campho Advance's menus as well as other visual assets such as fonts. Program ROM handles all access to this data by issuing a command first, then reading the relevant data from ROM_DATA_2. All I/O registers use their Wait State 1 mirrors (0xA000000) for Graphics ROM. The proceedure is as follows:
+
+------------------------------------------------------------------------
+//All writes to ROM_DATA_2 are 16-bit
+ROM_STAT = 0x4015
+
+//Read Command
+[ROM_DATA_2] = 0xB742
+
+//Unknown Parameter, always 1 for reads
+[ROM_DATA_2] = 0x0001
+
+//32-bit bank
+[ROM_DATA_2] = G_ROM_BANK_LO
+[ROM_DATA_2] = G_ROM_BANK_HI
+
+//32-bit offset
+[ROM_DATA_2] = G_ROM_OFFSET_LO
+[ROM_DATA_2] = G_ROM_OFFSET_HI
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+G_ROM_BANK refers to the specific 32-bit internal address the Campho Advance assigns portions of Graphics ROM. It is broken down into 2 16-bit components (LO and HI) and written LSB first. G_ROM_OFFSET refers to a 32-bit offset typically used when reading sections of Graphics ROM larger than 4000 bytes. Some larger offsets seem to have unknown significance when reading Graphics ROM. For most ordinary blocks larger than 4000 bytes, however, it addresses the next 4000 bytes in terms of 64-bit units. E.g. for an 8000 byte section of Graphics ROM, the first offset would be 0x00000000 to read the first 4000 byte half. The second offset would now be 0x000001F4 to read the next 4000 byte section.
+
+After issuing these writes, the GBA's CPU may need to wait for the data to become available. This can be checked by reading ROM_STAT and waiting for it to return the value 0x4015 (the same value initially written when specifying a Graphics ROM bank). Once that is done, the data can be read at ROM_DATA_2 in 16-bit units. Although Graphics ROM is normally read in 4000 bytes block at maximum, other smaller sizes are frequently read. The first two 16-bit reads will typically return an unknown parameter (possibly a Block ID or some kind of status) followed by the overall length of the block in 64-bit units. Afterwards, the rest of the graphics data in that block is streamed.
+
+Before reading any blocks from Graphics ROM, however, the above command must first be used G_ROM_OFFSET set to a value of 0xFFFFFFFF. This acts as some kind of reset mechanism. No data needs to be read, although ROM_STAT is always checked to make sure Graphics ROM is ready for data transfers. Typically, the offset 0xFFFFFFFF contains no more than 16-bytes of metadata about Graphics ROM bank being read, with details such as its overall length.
+
+When changing from one bank to another, data from the previous bank can still be read. For example, when switching to the offset 0xFFFFFFFF and reading more than 16-bytes, the Campho Advance will then respond with the next data from the old bank as if nothing had changed. Afterwards, when using a different offset for the new bank, new data will appear as expected. In effect, it takes a bit for the hardware to fully switch Graphics ROM banks, therefore it is important to check the length of data being read at this stage. This does not appear to be an issue if it is the first bank the Campho Advance is reading since boot.
+
+
+***************************************************
+7. Commands
+***************************************************
+
+The Campho Advance can issue a small number of commands to control various bits of hardware outside memory management. The process of sending commands is very similar to reading Graphics ROM. Once again, all I/O registers use their Wait State 1 mirrors (0xA000000). Each command is 32-bits.
+
+------------------------------------------------------------------------
+//All writes to ROM_DATA_2 are 16-bit
+ROM_STAT = 0x4015
+
+[ROM_DATA_2] = COMMAND_LO
+[ROM_DATA_2] = COMMAND_HI
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+Some commands return data for the Campho Advance to read. The meaning of the data is currently unknown, however, it can be read at ROM_DATA_2. 0xD778 seems to expect a single 16-bit value: 0x7780. Below are a list of known commands:
+
+------------------------------------------------------------------------
+Command		| Description
+------------------------------------------------------------------------
+0x9740		| Unknown
+0xB740		| Starts input data from the camera (small 58x48 frame)
+0xD740		| Starts input data from the camera (large 176x144 frame)
+0xD778		| Unknown (telecom status?)
+0xF740		| Halts input data from the camera
+0xF9FF		| Finishes input frame from camera (and requests another?)
+------------------------------------------------------------------------
+
+
+***************************************************
+8. Camera Capture
+***************************************************
+
+The Campho Advance is capable of capturing video input and displaying those frames in real-time on the GBA. It allows the handheld to access 2 different framebuffers that contain the relevant pixel data. The large one measures at 176x144 pixels on the GBA's screen. The small one measures at 58x48. They have similar aspect ratios, so images from the smaller buffer should roughly look the same as the larger one, albeit with more pixelation. The Campho Advance updates its video framebuffer at approximately 5 FPS (or less depending on when the frame is actually ready). The video input can come from the user's Campho Advance or over a telephone network when receiving a videochat, therefore, network conditions may affect how quickly the hardware can fully process a frame. All I/O registers use their Wait State 1 mirrors (0xA000000) for reading camera pixel data.
+
+Once a relevant command has been issued (see the above section), the Campho Advance will periodically alert the GBA when a new frame is available. Once ROM_STAT returns 0xA00A, a new frame can be read. A value of 0x4015 indicates no activity from the camera. Next, the GBA must read 32-bits of metadata from ROM_DATA_1. The first 16-bits designates Framebuffer Transfer Type (e.g. large frame or small frame) as well as the current "slice" of the framebuffer. The second 16-bits designates the Framebuffer Transfer Size in 32-bit units. The different Framebuffer Transfer Types are listed below:
+
+------------------------------------------------------------------------
+Type	| Description
+------------------------------------------------------------------------
+0xA90-	| Read a slice from the small (58x48) framebuffer
+0xAA0-	| Read a slice from the large (176x144) framebuffer
+0xCFFF	| Signals end of framebuffer reads (dummy data read here)
+------------------------------------------------------------------------
+
+Data for the small or large video capture framebuffers is not read all at once. Instead, data is read in shorter "slices". In the case of the small framebuffer, it is divided into 2 separate slices (58x35 and 58x13). For the large framebuffer, it is divided into 13 slices (176x12 each). The slices are drawn from top to bottom and each slice can be seen as an index that determines where it will get drawn on-screen. For example Slice 0 is drawn at the very top, while Slice 12 (on the large framebuffer) is drawn at the very bottom. The last 8-bits of the 16-bit Framebuffer Transfer Type is the slice number.
+
+Both the Framebuffer Transfer Type and Framebuffer Transfer Size are read by the Campho Advance with some of their bits flipped around. The Campho Advance adjusts these values like so:
+
+OUTPUT_16 = ((INPUT_16 LSL 3) | (INPUT_16 LSR 13))
+
+It should be noted that the pixel data from the camera is also needs this kind of reformatting. After sending the Framebuffer Transfer Type and Framebuffer Transfer Size, the Campho Advance does the following to read slices:
+
+------------------------------------------------------------------------
+//Prep Campho Advance to read pixel data
+ROM_STAT = 0xA00A
+
+[ROM_DATA_1] = 0x0008
+[ROM_DATA_1] = 0x0000
+
+ROM_CNT = 0xA00A
+
+//Grab pixel data at ROM_DATA_1
+WHILE FRAME_TRANSFER_SIZE NOT EQUAL TO ZERO
+	DATA_VAL = READ 16 BITS FROM [ROM_DATA_1]
+
+	//Reformat data and store in WRAM (above 64KB used to execute Program ROM)
+	DATA_VAL = ((DATA LSL 3) | (INPUT_16 LSR 13))
+	[0x2013000 + INDEX] = DATA_VAL
+
+	FRAME_TRANSFER_SIZE = FRAME_TRANSFER_SIZE - 1
+------------------------------------------------------------------------
+
+The large framebuffer requires some special considerations for its slices. For whatever reason, its 13 slices slightly overlaps. The chart below illustrates which slice draws which lines exactly:
+
+-----------------------------------------------------------
+Slice	| Lines Drawn
+-----------------------------------------------------------
+0	| 0   -  11
+1	| 11  -  23
+2	| 22  -  34
+3	| 33  -  45
+4	| 44  -  56
+5	| 55  -  67
+6	| 66  -  78
+7	| 77  -  89
+8	| 88  -  100
+9	| 99  -  111
+10	| 110 -  122
+11	| 121 -  133
+12	| 131 -  143
+-----------------------------------------------------------
+
+Note that the smaller framebuffer does not use anything like this at all. Although it uses 2 separate slices of 35 lines and 13 lines, they don't overlap. All pixels for both framebuffers (once reformatted) are 16-bit RGB555 values, meaning they can be plugged into the GBA's VRAM to draw a bitmap images. Once all pixel data for the camera has been pulled from each slice the Framebuffer Transfer Type changes to 0xCFFF. This signifies the end of readable camera input for a given frame. The Campho Advance then issues the 0xF9FF command to finish camera input and possibly request the next frame. It also writes 0x4015 to ROM_STAT before beginning the entire process all over again. When a new frame is ready, ROM_STAT will automatically read 0xA00A.
+
+
+***************************************************
+9. Configuration and Contact Data
+***************************************************
+
+The Campho Advance uses 24 bytes to save configuration data for several adjustable settings, such as brightness, contrast, and volume. The Campho Advance can read and write this entire block of memory all at once, or it can access each setting individually. Additionally, the Campho Advance can store contact data in the form of names and phone numbers using 24 bytes entries. The following process is used to read either configuration or contact data; all I/O registers use their Wait State 1 mirrors (0xA000000):
+
+------------------------------------------------------------------------
+//All writes are 16-bit
+ROM_STAT = 0x4015
+
+//Read all settings command
+[ROM_DATA_2] = 0xB778
+
+//32-bit settings parameter -> 0x1FFE4000 or 0x000040000
+[ROM_DATA_2] = DATA_TYPE_LO
+[ROM_DATA_2] = DATA_TYPE_HI
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+The DATA_TYPE value determines what data the Campho Advance will return. To read configuration data, use the value 0x1FFE4000. To read contact data, use the value 0x00004000.
+
+Afterwards, 28 bytes can be read from ROM_DATA_2. Like Program ROM and Graphics ROM data, the first 32-bits are metadata entries the Campho Advance uses to determine the length to read. The subsequent 24 bytes are the actual settings configuration. To write the entire configuration, the following process is used:
+
+------------------------------------------------------------------------
+//All writes are 16-bit
+ROM_STAT = 0x4015
+
+//Write all settings command
+[ROM_DATA_2] = 0x3778
+
+//Write (Data Length / 8), always 0x03
+[ROM_DATA_2] = 0x0003
+
+//Write configuration data
+[ROM_DATA_2] = CONFIG_OR_CONTACT_DATA_00
+[ROM_DATA_2] = CONFIG_OR_CONTACT_DATA_01
+...
+[ROM_DATA_2] = CONFIG_OR_CONTACT_DATA_11
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+The length of the config data is included, so a total of 26 bytes are written to ROM_DATA_2. Since the length never technically changes, it has a constant value of 0x0003. The rest of the configuration data follows after that, written as 12 16-bit values.
+
+The following process below outlines how to write to individual configuration settings:
+
+------------------------------------------------------------------------
+//All writes are 16-bit
+ROM_STAT = 0x4015
+
+//Write to settings ID to change a specific setting
+[ROM_DATA_2] = SETTINGS_ID
+
+//Write configuration data
+[ROM_DATA_2] = SETTINGS_DATA_LO
+[ROM_DATA_2] = SETTINGS_DATA_HI
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+Here, only 6 bytes are written: 16-bits for the settings ID and 32-bits for the actual data. The settings ID determines which setting will change. This chart details the known IDs for their settings:
+
+------------------------------------------------------------------------
+ID	| Setting
+------------------------------------------------------------------------
+0x1742	| Microphone Volume
+0x3742	| Speaker Volume
+0x5742	| Video Brightness
+0x7742	| Video Contrast
+------------------------------------------------------------------------
+
+The settings data itself uses a particular format. The lower 16-bits is always 0x4000. The upper 16-bits uses the following values to represent numbers 0 through 10:
+
+------------------------------------------------------------------------
+Number	| 16-bit Value
+------------------------------------------------------------------------
+0	| 0x0000
+1	| 0x4001
+2	| 0x8002
+3	| 0xC003
+4	| 0x0005
+5	| 0x4006
+6	| 0x8007
+7	| 0xC008
+8	| 0x000A
+9	| 0x400B
+10	| 0x800C
+------------------------------------------------------------------------
+
+Once this settings data has been written to the Campho Advance's configuration, the current value can be read back from ROM_DATA_2. Note that like most data read from ROM_DATA_2, the first 32-bits are metadata for the Campho Advance. Below is a layout of the Campho's 24-byte configuration data:
+
+------------------------------------------------------------------------
+Address		| Description
+------------------------------------------------------------------------
+0x00 - 0x01	| Data Type LSBs - Always 0xFFFF
+0x02 - 0x03 	| Data Type MSBs - Always 0x1FFE
+0x04 - 0x05	| Speaker Volume
+0x06 - 0x07	| Microphone Volume
+0x08 - 0x09	| Video Brightness
+0x0A - 0x0B	| Video Contrast
+0x0C - 0x0D	| Video Image Flip
+0x0E - 0x0F	| Pulse or Tone Dialing
+0x10 - 0x17	| Unknown
+------------------------------------------------------------------------
+
+Below is a layout of the Campho's 24-byte entries for contact data:
+
+------------------------------------------------------------------------
+Address		| Description
+------------------------------------------------------------------------
+0x00 - 0x01	| Data Type LSBs - Always 0xFFFF
+0x02 - 0x03	| Data Type MSBs - Always 0xFFFF
+0x04 - 0x0D	| Contact Name (10 characters max)
+0x0E - 0x17	| Contact Phone Number (10 digits max)
+------------------------------------------------------------------------
+
+The contact's name can be a mixture of katakana, Latin characters, and numbers. The format is currently unknown. The contact's phone number uses the same encoding format as dialing phone numbers. See the section below for more details.
+
+
+***************************************************
+10. Dialing Phone Numbers
+***************************************************
+
+The Campho Advance has a specific command that will dial a phone number entered by the user. Unlike several other commands, this one takes parameters of variable lengths. The process of sending commands, with the parameters appended. All I/O registers use their Wait State 1 mirrors (0xA000000).
+
+------------------------------------------------------------------------
+//All writes to ROM_DATA_2 are 16-bit
+ROM_STAT = 0x4015
+
+[ROM_DATA_2] = 0x3740
+
+[ROM_DATA_2] = NUMBER_OF_DIGITS
+[ROM_DATA_2] = DIGITS_01_AND_02
+[ROM_DATA_2] = DIGITS_03_AND_04
+[ROM_DATA_2] = DIGITS_05_AND_06
+[ROM_DATA_2] = DIGITS_07_AND_08
+[ROM_DATA_2] = DIGITS_09_AND_10
+
+ROM_CNT = 0x4015
+------------------------------------------------------------------------
+
+The Campho Advance can dial numbers of up to 10 digits. The longer the phone number, the more bytes need to be written as parameters. NUMBERS_OF_DIGITS is essentially the length of the phone number. The chart below describes the encoding used:
+
+------------------------------------------------------------------------
+Number	| 16-bit Value
+------------------------------------------------------------------------
+1	| 0x2000
+2	| 0x4000
+3	| 0x6000
+4	| 0x8000
+5	| 0xA000
+6	| 0xC000
+7	| 0xE000
+8	| 0x0001
+9	| 0x2001
+10	| 0x4001
+------------------------------------------------------------------------
+
+The actual digits for the phone number are stored in a 16-bit values in pairs. Odd and even digits have different encodings. Note that the "*" / "#" key appears to be just "." on the Campho Advance.
+
+------------------------------------------------------------------------
+Key (Odd Digits)	| 16-bit Value
+------------------------------------------------------------------------
+.			| 0xC005
+0			| 0x0006
+1			| 0x2006
+2			| 0x4006
+3			| 0x6006
+4			| 0x8006
+5			| 0xA006
+6			| 0xC006
+7			| 0xE006
+8			| 0x0007
+9			| 0x2007
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+Key (Even Digits)	| 16-bit Value
+------------------------------------------------------------------------
+.			| 0x05C0
+0			| 0x0600
+1			| 0x0620
+2			| 0x0640
+3			| 0x0660
+4			| 0x0680
+5			| 0x06A0
+6			| 0x06C0
+7			| 0x06E0
+8			| 0x0700
+9			| 0x0720
+------------------------------------------------------------------------
+
+These Odd and Even digits encodings are logically OR'ed together to form a single 16-bit encoding. If an odd digit is the last digit in the phone number, then it remains unchanged.
+
+***************************************************
+11. System Compatibility
+***************************************************
+
+The Campho Advance is incompatible with any model from the Nintendo DS family. Attempting to boot the original DS or a DS Lite with the Campho Advance in Slot-2 while providing external power generally causes the system to halt with a blank white screen. Whether due to the unique power requirements of the cartridge or the novel way it streams ROM data, the cause of this failure remains unknown.
+
+In theory, however, the Campho Advance should work with the following Game Boy Advance models: AGB-001 (original GBA), AGS-001 (GBA SP), AGS-101 (GBA SP), OXY-001 (Game Boy Micro), and DOL-17 (Game Boy Player). It must be noted that the Campho Advance was developed and released before the DS launched, so Digital Act likely had no idea it would become incompatible when the next handheld generation came around. A similar situation happened with the Pocket Sonar when the Game Boy Color launched.
